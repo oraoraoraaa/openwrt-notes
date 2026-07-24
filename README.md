@@ -1,2 +1,25 @@
 # openwrt-notes
-Notes on exploring the openwrt router operating system.
+
+Personal notes from running and debugging OpenWrt.
+
+## Layout
+
+```text
+notes/
+  troubleshooting/   # symptoms, root causes, fixes, verification
+```
+
+## Notes
+
+| Note | Summary |
+|---|---|
+| [Config lost on reboot](notes/troubleshooting/config-lost-on-reboot.md) | tmpfs overlay when residual flash was never formatted |
+
+## Conventions
+
+- Keep folder and file names short and topic-based
+- Do **not** put router model names in paths or filenames
+- Mention device/platform only inside a note when it matters
+- Prefer symptom → cause → fix → verify → prevent structure for troubleshooting notes
+
+See [AGENTS.md](AGENTS.md) for agent/contributor guidance.
