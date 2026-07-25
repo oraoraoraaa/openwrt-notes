@@ -14,6 +14,7 @@ notes/
 | Note | Summary |
 |---|---|
 | [Config lost on reboot](notes/troubleshooting/config-lost-on-reboot.md) | tmpfs overlay when residual flash was never formatted |
+| [OpenClash breaks remote SSH](notes/troubleshooting/openclash-ssh-broken.md) | Fake-IP + transparent proxy; fix with `DST-PORT,22,DIRECT` |
 
 ## Conventions
 
