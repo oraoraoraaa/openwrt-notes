@@ -1,123 +1,173 @@
 # Router unreachable after reboot
 
-**Device reported by owner:** CMCC RAX3000Me
+**Device:** CMCC RAX3000Me, reported by its firmware as CMCC RAX3000M because the models share an image profile.
 
-**Model reported by firmware:** CMCC RAX3000M (shared image profile)
+**Observed hardware:** eMMC storage, MT7531 LAN switch. **Firmware:** OpenWrt 25.12.5, `r33051-f5dae5ece4`, kernel 6.12.94.
 
-**Observed storage:** eMMC, `SCA64G`, 58.2 GiB; MT7531 LAN switch
+**Incident date:** 2026-10-08. **Result:** Original settings recovered by repairing the settings filesystem. Reflashing was not necessary.
 
-**Firmware:** OpenWrt 25.12.5, `r33051-f5dae5ece4`, kernel 6.12.94
+## 1. What happened
 
-**Date:** 2026-10-08 (Asia/Shanghai)
+After a reboot, all configured Wi-Fi networks disappeared. A computer connected directly to a LAN port could not reach the router at its usual address, `192.168.39.1`. The cable had a physical link, but the router did not answer local address-discovery requests or SSH connections. SSH is an encrypted connection to a device's command line.
 
-**Status:** Recovered through TFTP RAM boot and offline F2FS repair; no reflash
+An attempted failsafe boot produced rapid red LED flashing, but local access still failed. A flashing LED alone does not confirm that recovery networking works. A temporary recovery system transferred through the bootloader eventually provided access.
 
-## 1. Symptom
+## 2. Why the router stopped working
 
-After reboot, the configured wireless networks disappeared and a direct Ethernet connection to LAN did not provide access. The normal LAN address was `192.168.39.1`. Ethernet carrier was present, but there was no ARP response at that address. Checks of `192.168.1.1` and `192.168.0.1` also failed.
+### How OpenWrt stores settings
 
-The owner had encountered a similar failure before and remembered recovering through failsafe. During this incident, rapid red LED flashing was observed after an attempted failsafe entry, but no ARP or SSH response was obtained on the tested LAN ports. This does not establish whether failsafe actually started. LED color alone is insufficient evidence.
+OpenWrt combines a mostly read-only firmware image with a writable area for settings and added software. The writable area is called the **overlay**: its files take precedence over the originals supplied by the firmware. **Mounting** means making a filesystem accessible to the running system.
 
-The computer initially used another Wi-Fi network on `192.168.1.0/24`, plus Mihomo TUN. The other network was changed to `192.168.3.0/24` to avoid overlap with recovery. A temporary source-based routing table kept recovery SSH on Ethernet rather than the proxy or the other router.
+On this eMMC installation, the writable area uses **F2FS**, a filesystem designed for flash storage. eMMC is the router's internal flash storage; **RAM** is temporary working memory that disappears when power is removed.
 
-## 2. Root cause and evidence
+```mermaid
+flowchart LR
+    A["Read-only firmware<br/>SquashFS on /dev/fit0"] --> C["Combined OpenWrt system"]
+    B["Saved settings and added software<br/>F2FS on /dev/fitrw"] --> C
+    C --> D["LAN, Wi-Fi, and services"]
+    E["Corrupt settings metadata"] -. "prevents mounting" .-> B
+```
 
-### Confirmed immediate fault
+The installed firmware was readable. The settings filesystem could not mount because part of its bookkeeping was inconsistent. A filesystem's metadata records where files are stored; an **inode** is one of those file records, and an **extent** describes a run of storage blocks belonging to a file.
 
-The installed squashfs system was readable, but the persistent F2FS overlay on `/dev/fitrw` could not mount. A read-only mount with recovery disabled produced:
+The kernel rejected an invalid extent in inode `0x3d2`. The filesystem checker found the same fault. After offline repair, its checks passed, the filesystem mounted, and the saved LAN and Wi-Fi settings returned. This identifies a concrete fault and strongly connects it to the loss of access.
+
+The failed normal boot was not captured through a serial console, so the exact startup sequence that left LAN unavailable is still unknown.
+
+### Evidence, with its meaning
+
+| Observation | Meaning |
+|---|---|
+| Read-only firmware could be mounted | The base system was accessible |
+| Settings filesystem reported `invalid_blkaddr corrupted_inode` | A file record referred to storage inconsistently |
+| Kernel said `extent info [12800, 33, 512] is incorrect, run fsck to fix` | The filesystem needed checking and repair |
+| Other main allocation and file counts agreed | The checker found a relatively localized fault |
+| Repair followed by a second check passed | The detected metadata inconsistency was repaired |
+| Normal boot restored LAN and Wi-Fi | Existing configuration was recoverable |
+
+<details>
+<summary>Exact diagnostic messages for comparing a future failure</summary>
 
 ```text
 F2FS-fs (fitrw): Inconsistent error blkaddr:13311, sit bitmap:0
 F2FS-fs (fitrw): sanity_check_extent_cache: inode (ino=3d2) extent info [12800, 33, 512] is incorrect, run fsck to fix
-```
-
-An offline dry-run check confirmed:
-
-```text
 Info: fs errors: invalid_blkaddr corrupted_inode
 Info: checkpoint state = 46 : crc compacted_summary orphan_inodes sudden-power-off
 [ASSERT] (fsck_chk_inode_blk:1042) --> ino: 0x3d2 has wrong ext: [pgofs:33, blk:12800, len:512]
-[FSCK] other corrupted bugs [Fail]
 ```
 
-Allocation bitmap, reachable node counts, inode counts, and free-segment counts otherwise agreed. After repair, all reported checks passed, the overlay mounted, and the original network settings returned on normal boot. This establishes overlay corruption as a recoverable fault and strongly connects it to the observed loss of access.
+</details>
 
-Normal failed-boot console output was not captured, so the exact startup path that led to no LAN access remains unverified. No evidence established OpenClash as the cause. Installed OpenClash files alone do not establish causation.
+### Why did the corruption happen?
 
-### What caused the corruption?
+The filesystem recorded an **unclean shutdown**, meaning it was not left in its normal fully closed state. This can follow interrupted power, a crash, a watchdog reset, or a storage/filesystem fault. It does not prove that someone unplugged the router. No originating cause was established.
 
-The checkpoint recorded an unclean shutdown. It does **not** prove that the owner unplugged power: a kernel crash, watchdog reset, filesystem bug, or storage/power instability can also leave an unclean checkpoint. No specific originating cause was proven.
+The eMMC lifetime estimates did not report an end-of-life warning, and the captured recovery log showed no MMC input/output error. These observations do not rule out intermittent hardware or power problems. No evidence established a particular installed app as the cause.
 
-The eMMC reported `life_time = 0x01 0x01` and `pre_eol_info = 0x01`, which do not indicate exhausted estimated lifetime or a pre-end-of-life warning. These estimates do not rule out intermittent faults. The recovery boot log showed no MMC I/O error in the captured evidence.
+This differs from [settings lost on reboot](config-lost-on-reboot.md): that earlier incident had an **unformatted** settings area and kept changes only in RAM. Here, the existing filesystem was formatted but damaged. **Repair and formatting are different operations; formatting erases the old filesystem.**
 
-### Difference from the earlier incident
+## 3. Choose a recovery path
 
-[Config lost on reboot](config-lost-on-reboot.md) describes an **unformatted** residual overlay and RAM-only configuration. This incident had an existing F2FS filesystem containing persistent settings and packages; it needed repair, not initial formatting. Do not apply the earlier `mkfs` procedure to this failure without intentionally discarding the old overlay.
+Start with the least destructive working option. Do not erase settings merely because Wi-Fi is missing.
 
-## 3. Recovery manual
+```mermaid
+flowchart TD
+    A["Connect by cable to a LAN port"] --> B{"Can the management page open?"}
+    B -->|Yes| C["Save a backup in LuCI<br/>Inspect logs and settings"]
+    B -->|No| D["Try OpenWrt failsafe"]
+    D --> E{"Does recovery SSH respond?"}
+    E -->|Yes| F["Inspect storage before changing it"]
+    E -->|No| G["Boot temporary recovery through TFTP"]
+    G --> F
+    F --> H{"Can the saved filesystem be repaired?"}
+    H -->|Yes| I["Repair offline<br/>Boot and verify saved settings"]
+    H -->|No| J["Preserve recoverable data<br/>Reflash and restore compatible settings"]
+```
 
-Commands below distinguish **computer** and **router**. Device names and partition mappings must be checked on every recovery. The observed device used eMMC; do not substitute these block-device commands on a NAND variant.
+**If the management page works:** open [the usual LAN address](http://192.168.39.1/) in a browser. **LuCI** is OpenWrt's web interface. Use **System → Backup / Flash Firmware → Generate archive** to save a private configuration backup. Check **Status → System Log** and **Status → Kernel Log**. Menu labels can vary with the installed version and language.
 
-### A. Try normal access or failsafe first
+**If it does not:** try failsafe. This is a minimal OpenWrt boot that bypasses normal settings, usually at `192.168.1.1`, without automatic address assignment or Wi-Fi. Briefly press and release Reset during early OpenWrt boot; its timing window is short. Check SSH to confirm access. Follow the [official failsafe instructions](https://openwrt.org/docs/guide-user/troubleshooting/failsafe_and_factory_reset). Do not run a factory reset before preserving settings.
 
-Connect directly to LAN. Lack of internet is not proof that local management is unavailable: check addresses, DHCP, ARP, HTTP, and SSH separately.
+The remainder documents the TFTP route that worked on this router. Filesystem commands below apply to its **eMMC mapping**, not automatically to NAND variants.
 
-OpenWrt failsafe normally uses `192.168.1.1`, with DHCP and Wi-Fi disabled. Set the computer to a static address such as `192.168.1.254/24`. Briefly press and release Reset during early OpenWrt boot; the timing window is short. Check SSH to confirm success. A long hold during power-on invokes a different bootloader procedure on this installation.
+## 4. Download the right files in a browser
 
-If failsafe works, collect logs and mount information before changing settings. `mount_root` attaches the installed overlay in failsafe, but may fail when that filesystem is corrupt. Do not run `factoryreset`, `firstboot`, `jffs2reset`, or `mkfs` before preserving evidence and deciding to erase settings.
+1. Open the [OpenWrt Firmware Selector for this device and release](https://firmware-selector.openwrt.org/?id=cmcc_rax3000m&target=mediatek%2Ffilogic&version=25.12.5). Alternatively, search for “OpenWrt Firmware Selector,” choose **CMCC RAX3000M / CMCC RAX3000Me**, and select the intended supported release.
+2. Check the model and release against the [device support page](https://openwrt.org/toh/cmcc/rax3000m). Support depends on hardware revision; the page lists all known RAX3000Me revisions as supported from 25.12.3 onward.
+3. Download **SYSUPGRADE**. If the selector does not offer the recovery image, use the [official 25.12.5 download directory](https://archive.openwrt.org/releases/25.12.5/targets/mediatek/filogic/). Use the browser's Find command to locate `cmcc_rax3000m-initramfs-recovery.itb`.
+4. Save both files in a folder such as `Downloads/openwrt-recovery`.
 
-### B. Obtain the two different images
+| File type | What it does | Does it reinstall the saved system? |
+|---|---|---|
+| `initramfs-recovery.itb` | Starts a temporary recovery system in RAM | Not by the transfer alone on the observed boot path; later commands may write storage |
+| `squashfs-sysupgrade.itb` | Installs the persistent firmware through OpenWrt's upgrade process | Yes, when you confirm flashing |
+| Configuration `.tar.gz` backup | Restores saved files such as LAN and Wi-Fi settings | No; it is not firmware or a package installer |
 
-The shared official profile is `cmcc_rax3000m`, including supported RAX3000Me revisions. Hardware support is revision-dependent; consult the device page before choosing another release. All known RAX3000Me revisions are listed as supported from 25.12.3 onward.
+An **initramfs** is a small initial filesystem bundled with the kernel; here it lets Linux run without mounting the damaged installed settings. A **bootloader**, here U-Boot, runs before Linux and starts the chosen image. Its recovery path can work even when normal OpenWrt access fails.
 
-| Image | Purpose |
+### Check the download
+
+A **SHA-256 checksum** is a file fingerprint. Compare the downloaded file's checksum with the official value to detect incomplete or different downloads. A graphical checksum utility can do this; select SHA-256 and the downloaded file. If none is available, this short command computes it without requiring any memorized download commands:
+
+**Computer terminal, in the download folder:**
+
+```sh
+sha256sum openwrt-25.12.5-mediatek-filogic-cmcc_rax3000m-*.itb
+```
+
+| Official 25.12.5 image | SHA-256 |
 |---|---|
-| `openwrt-25.12.5-mediatek-filogic-cmcc_rax3000m-initramfs-recovery.itb` | TFTP boot of a temporary recovery system |
-| `openwrt-25.12.5-mediatek-filogic-cmcc_rax3000m-squashfs-sysupgrade.itb` | Install/reinstall the persistent system with `sysupgrade` |
-| `OpenWrt-RAX3000M-Necessities.tar.gz` | File-level configuration backup; not firmware or a complete disk backup |
+| Recovery | `904c75334ac49ae190cf8e3d6c168e62c801d7966ac8005696cc2830ad8a8c4f` |
+| Sysupgrade | `cd194d6ed64f1fa60d1315e9eafa156138c4c58b76817fb22370af26c4946b21` |
 
-**Computer:**
+These values apply only to those official 25.12.5 images. Use the published values for another release. Stop if the values do not match.
 
-```sh
-mkdir -p "$HOME/Downloads/openwrt-recovery/tftp"
-cd "$HOME/Downloads/openwrt-recovery"
-base=https://downloads.openwrt.org/releases/25.12.5/targets/mediatek/filogic
-curl -fL --retry 3 -o recovery.itb "$base/openwrt-25.12.5-mediatek-filogic-cmcc_rax3000m-initramfs-recovery.itb"
-curl -fL --retry 3 -o sysupgrade.itb "$base/openwrt-25.12.5-mediatek-filogic-cmcc_rax3000m-squashfs-sysupgrade.itb"
-printf '%s  %s\n' \
-  904c75334ac49ae190cf8e3d6c168e62c801d7966ac8005696cc2830ad8a8c4f recovery.itb \
-  cd194d6ed64f1fa60d1315e9eafa156138c4c58b76817fb22370af26c4946b21 sysupgrade.itb \
-  | sha256sum -c -
+## 5. Prepare the computer to serve the recovery file
+
+### What is TFTP, and who sends what?
+
+**TFTP** means *Trivial File Transfer Protocol*. It is a simple file-transfer method commonly built into bootloaders. The computer runs a **server**, which makes one folder available. The router acts as a **client**: it requests a specific filename, receives it in numbered blocks, acknowledges them, and boots the received image.
+
+TFTP's first request uses UDP port 69. It has no login or encryption, so use it only on the directly connected recovery link and stop the server afterward. It is not an HTTP website: opening a browser at the TFTP server address will not transfer the image.
+
+```mermaid
+sequenceDiagram
+    participant R as Router U-Boot: 192.168.1.1
+    participant P as Computer TFTP server: 192.168.1.254
+    R->>P: Request the exact recovery filename
+    P-->>R: Send numbered file blocks
+    R->>P: Acknowledge received blocks
+    Note over R,P: Retransmit blocks if necessary
+    Note over R: Boot the received Linux image in RAM
+    Note over R: Installed settings can now be inspected offline
 ```
 
-Both must report `OK`. These hashes apply only to the official 25.12.5 files. Verify another release against its official listing/checksums. Do not rename the sysupgrade image to the recovery filename.
+### Set the wired address through network settings
 
-The installed U-Boot requested the **unversioned** filename:
+Connect the cable to a **LAN** port. In the computer's network settings, edit the wired connection's IPv4 configuration:
 
-```sh
-cp recovery.itb tftp/openwrt-mediatek-filogic-cmcc_rax3000m-initramfs-recovery.itb
+| Setting | Recovery value |
+|---|---|
+| Address method | Manual/static |
+| Computer address | `192.168.1.254` |
+| Netmask/prefix | `255.255.255.0` or `/24` |
+| Gateway and DNS | Leave blank for this direct link |
+
+In Linux desktops, this is usually **Settings → Network → Wired → IPv4**. In Windows, edit the Ethernet adapter's IPv4 properties. Write down the original settings so they can be restored afterward. Avoid connecting another network using the same subnet while doing recovery.
+
+### Start a TFTP server
+
+**Windows graphical option:** download [Tftpd64 from its project's download page](https://github.com/PJO2/tftpd64/blob/master/Readme.md), open it, choose the recovery folder as **Current Directory**, and select `192.168.1.254` under **Server interfaces**. Use only the TFTP service; this task does not need its DHCP or DNS servers. Allow it through the firewall on the recovery connection if prompted.
+
+In your file manager, make a `tftp` subfolder and copy the recovery image into it. Rename that **copy** to exactly:
+
+```text
+openwrt-mediatek-filogic-cmcc_rax3000m-initramfs-recovery.itb
 ```
 
-### C. Prepare computer networking and TFTP
+Choose that subfolder as the server directory. The unversioned filename is what the observed U-Boot requests. Do not rename the sysupgrade file as though it were a recovery image.
 
-Record existing NetworkManager settings first. Keep an independent internet connection on a different subnet when needed. NetworkManager autoconnect priority selects profiles; route metrics select competing routes. They are different controls.
-
-**Computer, using the observed Ethernet interface `enp5s0`:**
-
-```sh
-nmcli connection add type ethernet ifname enp5s0 con-name OpenWrt-Recovery \
-  connection.autoconnect yes connection.autoconnect-priority 100 \
-  ipv4.method manual ipv4.addresses 192.168.1.254/24 \
-  ipv4.never-default yes ipv4.route-table 139 \
-  ipv4.routing-rules 'priority 100 from 192.168.1.254/32 table 139' \
-  ipv6.method disabled
-nmcli connection up OpenWrt-Recovery
-ip route get 192.168.1.1 from 192.168.1.254
-```
-
-Expected route: `dev enp5s0 table 139`. Use a different unused table/rule priority if these are already occupied. If the profile already exists, inspect or modify it rather than adding duplicates. This creates a connection profile, not a virtual network card.
-
-Install `dnsmasq` through the computer's package manager if absent. Start a temporary, TFTP-only server in a terminal:
+**Linux fallback:** install `dnsmasq` using your distribution's package manager if it is absent. This example uses Ethernet interface `enp5s0`; replace it with your wired interface name shown in network details. Start it on the **computer**, not the router:
 
 ```sh
 sudo dnsmasq --conf-file=/dev/null --no-daemon --port=0 \
@@ -128,51 +178,61 @@ sudo dnsmasq --conf-file=/dev/null --no-daemon --port=0 \
   --pid-file=/tmp/openwrt-recovery-dnsmasq.pid
 ```
 
-Leave this terminal open. Administrator privileges are needed for UDP 69 and interface binding. No DHCP or DNS service is configured. If a firewall blocks transfers, allow TFTP only on the wired recovery link rather than disabling the entire firewall.
+Keep the window open. This serves files without providing DNS or DHCP. If transfer fails, inspect its log and the wired firewall rules rather than disabling every firewall rule.
 
-### D. Enter OpenWrt U-Boot TFTP recovery
+## 6. Start the router's TFTP recovery mode
 
-This sequence is for the **installed OpenWrt U-Boot**, not an assurance that the factory bootloader behaves identically:
+This procedure is for the **installed OpenWrt U-Boot** on the observed router. Factory or other custom bootloaders can behave differently; check the [device recovery instructions](https://openwrt.org/toh/cmcc/rax3000m).
 
-1. Connect the computer directly to a LAN port and start the TFTP server.
+1. Start the TFTP server and keep the Ethernet cable in LAN.
 2. Power off the router.
-3. Hold Reset, then power on while continuing to hold it.
-4. Release Reset after approximately 10 seconds.
-5. Wait for transfer and boot to complete. Allow about two minutes before judging failure.
+3. Press and hold **Reset**, then power on while holding it.
+4. Release Reset after approximately **10 seconds**.
+5. Wait up to about two minutes for transfer and boot. Look for a completed transfer in the server's window.
 
-The successful server log in this incident was:
+A successful transfer produced a log saying the recovery file was sent to `192.168.1.1`. That proves the file transferred; confirm that the received system actually booted before proceeding.
 
-```text
-dnsmasq-tftp: sent .../openwrt-mediatek-filogic-cmcc_rax3000m-initramfs-recovery.itb to 192.168.1.1
-```
+Try opening [192.168.1.1](http://192.168.1.1/) in a browser. A recovery image may lack LuCI, so a missing web page does not necessarily mean the boot failed. If unavailable, connect with an SSH application such as a terminal's SSH client:
 
-Confirm a running RAM recovery system, not just a successful transfer:
+**Computer:**
 
 ```sh
-ssh -b 192.168.1.254 root@192.168.1.1
+ssh root@192.168.1.1
 ```
 
-Accept a new host key only when you have confirmed that you are reaching the directly connected recovery router. The observed initramfs accepted a blank root password. Normal firmware required the configured password afterward.
+The observed recovery system accepted a blank password. Normal firmware later required its saved password. Accept a changed SSH host key only after confirming you are connected to the intended router.
 
-**Router:**
+If no file request appears, check the server address, requested filename, wired link, and other LAN ports. If the file transfers but recovery stays unreachable, a **serial console** may be needed: it displays boot messages directly over hardware pins rather than the network. This board's documentation specifies 3.3 V UART, 115200 8N1. This is a hardware recovery step, not a reason to blindly flash a bootloader.
+
+## 7. Inspect and repair the saved filesystem
+
+LuCI does not provide this offline filesystem repair, so this part needs a command-line connection. **Run the following router commands in the recovery SSH session**, not on your computer. A raw device name is not portable across router models or storage variants.
+
+### Confirm that you are in RAM recovery
 
 ```sh
 ubus call system board
 cat /proc/mounts
-cat /proc/mtd
 ls -l /dev/fit* /dev/mmcblk*
-dmesg
-ls -la /sys/fs/pstore
-fw_printenv
 ```
 
-The observed root was `tmpfs / tmpfs`, `rootfs_type` was `initramfs`, `/dev/fit0` mapped the installed production squashfs, and `/dev/fitrw` mapped its residual overlay. Firmware named the board CMCC RAX3000M although the owner identified it as RAX3000Me.
+Look for `rootfs_type` set to `initramfs` and `/` on `tmpfs`, meaning the current root lives in RAM. Confirm the eMMC mappings before continuing. `/dev/fitrw` must **not** be mounted as the live `/overlay` when checking or repairing it.
 
-If there is no TFTP request, check the cable, all LAN ports, static address, requested filename, server logs, and installed bootloader. A custom bootloader may request a different filename/IP. If TFTP transfers but Linux does not become reachable, capture serial boot output. The device page documents a 3.3 V UART at 115200 8N1 and `mtk_uartboot` recovery. Do not connect a 5 V serial adapter or casually rewrite BL2/FIP.
+### Save evidence and a copy before repair
 
-### E. Preserve the damaged filesystem
+**Computer terminal:**
 
-Do this before repair while the installed overlay is **unmounted**. Read-only mounts must disable journal/recovery replay where supported.
+```sh
+mkdir -p "$HOME/Downloads/openwrt-recovery/evidence"
+cd "$HOME/Downloads/openwrt-recovery/evidence"
+ssh root@192.168.1.1 'dmesg; logread; fw_printenv' > recovery.txt
+ssh root@192.168.1.1 'dd if=/dev/fitrw bs=1048576 | gzip -1' > overlay-before-repair.img.gz
+gzip -t overlay-before-repair.img.gz
+```
+
+`dd` copies the raw settings partition; `gzip` compresses it. Wait for the copy to finish successfully. Keep it private because it can contain passwords and keys. The observed copy covered 2,136,371,200 bytes, about 2 GiB. For another installation, read `/sys/class/block/fitrw/size` on the router and multiply the sector count by 512; verify that the decompressed copy has that size. `gzip -t` checks compression integrity, not whether every sector was copied.
+
+### Confirm the fault without modifying the filesystem
 
 **Router:**
 
@@ -184,36 +244,25 @@ mount -t f2fs -o ro,norecovery /dev/fitrw /mnt/saved-overlay
 dmesg | tail -60
 ```
 
-Failure of the F2FS mount is diagnostic evidence. If it succeeds, unmount it before running fsck.
-
-**Computer:**
+`ro,norecovery` requests a read-only mount without replaying unfinished filesystem recovery. In this incident it failed with the metadata errors shown earlier. If it succeeds, **unmount it before running the checker**:
 
 ```sh
-mkdir -p "$HOME/Downloads/openwrt-recovery/evidence"
-cd "$HOME/Downloads/openwrt-recovery/evidence"
-ssh -b 192.168.1.254 root@192.168.1.1 'dmesg; logread; fw_printenv' > recovery.txt
-# Verify that /dev/fitrw is unmounted before this copy.
-ssh -b 192.168.1.254 root@192.168.1.1 \
-  'dd if=/dev/fitrw bs=1048576 | gzip -1' > overlay-before-repair.img.gz
-gzip -t overlay-before-repair.img.gz
+umount /mnt/saved-overlay
 ```
 
-The observed partition size was 4,172,600 sectors (2,136,371,200 bytes), about 2 GiB. Check `cat /sys/class/block/fitrw/size` for the current size. A valid gzip stream alone does not prove every sector was copied; check SSH/dd success and the decompressed byte count against sectors × 512. Do not start repair while the copy is still running.
-
-Keep images, settings archives, and credentials outside this Git repository. Raw overlay images can contain Wi-Fi keys, proxy subscriptions, SSH keys, and passwords. In this session they were retained under the chat workspace's `work/router-diagnostics/` directory.
-
-### F. Check and repair offline
-
-Locate the tool; on this recovery system it was `/usr/sbin/fsck.f2fs`. Do not assume it is under `/sbin`. If missing, obtain a matching recovery image with the tool or install the compatible `f2fsck` package into the RAM recovery environment when connectivity is available. Do not format the filesystem to solve a missing-tool problem.
-
-**Router, overlay unmounted:**
+**Router, settings filesystem unmounted:**
 
 ```sh
-cat /proc/mounts
 /usr/sbin/fsck.f2fs --dry-run -f /dev/fitrw
 ```
 
-`--dry-run` was supported by the observed tool; inspect help on other versions. It may print proposed writes even though dry-run is enabled. Save output. The following command **modifies filesystem metadata** and can discard irreparable data; use it only after the backup:
+**fsck** means filesystem check. `--dry-run` inspects/proposes changes without applying the repair. This option was supported by the observed tool. If the checker is missing, use a compatible recovery environment that contains it, or install the compatible `f2fsck` package into RAM recovery if connectivity is available. Do not format just because a repair tool is missing.
+
+### Apply and verify the repair
+
+**This changes filesystem metadata and can discard irreparable data. Proceed only after preserving the copy.**
+
+**Router:**
 
 ```sh
 /usr/sbin/fsck.f2fs -f -y /dev/fitrw
@@ -222,26 +271,17 @@ mount -t f2fs -o ro,norecovery /dev/fitrw /mnt/saved-overlay
 cat /mnt/saved-overlay/upper/etc/config/network
 ```
 
-The second check must have no remaining failed checks; mount must succeed. Save recovered settings outside the router before reboot if needed:
+The second check must have no failed checks, the mount must succeed, and saved settings should be readable. If repair fails, continue to the reflash fallback rather than repeatedly forcing it.
+
+To preserve recovered files, this **computer** command saves an additional archive:
 
 ```sh
-# Computer; this archive has an upper/etc layout, not standard sysupgrade backup layout.
-ssh -b 192.168.1.254 root@192.168.1.1 \
-  'tar -czf - -C /mnt/saved-overlay upper/etc' > recovered-settings.tar.gz
+ssh root@192.168.1.1 'tar -czf - -C /mnt/saved-overlay upper/etc' > recovered-settings.tar.gz
 ```
 
-Do not feed that raw-overlay archive directly to `sysupgrade -r`. Inspect/extract it separately if manual recovery becomes necessary.
+That archive starts with `upper/etc`, unlike a standard settings backup. Do not upload it directly as a LuCI restore archive; inspect it separately.
 
-### G. Boot the repaired installation
-
-**Computer:** add a temporary address for the installed LAN subnet:
-
-```sh
-nmcli connection modify OpenWrt-Recovery \
-  +ipv4.addresses 192.168.39.2/24 \
-  +ipv4.routing-rules 'priority 101 from 192.168.39.2/32 table 139'
-nmcli connection up OpenWrt-Recovery
-```
+### Boot normally
 
 **Router:**
 
@@ -252,125 +292,98 @@ sync
 reboot
 ```
 
-Allow normal boot time. Connect to `192.168.39.1` using the original credentials. If normal SSH rejects a blank password, that can mean the saved credentials were successfully restored, not that recovery failed.
+In the computer's wired network settings, restore automatic addressing (DHCP). Allow the router to boot, then open [192.168.39.1](http://192.168.39.1/) and sign in with the original credentials. If DHCP is unavailable, temporarily use `192.168.39.2/24` to reach the saved LAN address.
 
-## 4. Verification
+## 8. Verify recovery in the web interface
 
-Observed after repair: ARP resolved at `192.168.39.1`, HTTP returned 200, and all three saved wireless networks appeared in a fresh scan. The owner independently confirmed wireless was back. After computer cleanup, Ethernet obtained `192.168.39.126/24` through DHCP, the default route pointed to `192.168.39.1`, and an HTTPS request to GitHub returned 200. That verifies an operational wired internet path at that time, not every WAN service.
+- **Status → Overview:** check the expected firmware and available storage. A read-only firmware area showing 100% usage is normal; its size is fixed.
+- **Network → Interfaces:** verify LAN and WAN are up, with the expected LAN address and an upstream connection.
+- **Network → Wireless:** confirm both radios and the intended access points are enabled.
+- **Status → Kernel Log:** search for new `F2FS`, `fitrw`, or storage errors.
+- Connect a client to Wi-Fi, open the management page, and test internet access separately.
 
-A second pre-reboot fsck passed. Full normal-boot router logs and a later repeated reboot were not captured in this session. Run these checks on the healthy router when available:
+The original repair passed the second filesystem check and restored all three Wi-Fi networks. The owner confirmed wireless access. A subsequent normal-boot audit confirmed `/dev/fitrw` mounted at `/overlay`, valid active UCI settings, working DNS/firewall checks, and WAN connectivity. It also restored missing HTTPS certificate files; both HTTP and HTTPS then responded. This was not a repeated-reboot endurance test.
+
+**Advanced mount check, on the router:**
 
 ```sh
 cat /proc/mounts | grep -E 'fitrw|overlay'
-df -h
-ubus call network.interface.lan status
-ubus call network.interface.wan status
-wifi status
-dmesg | grep -iE 'f2fs|fitrw|mount_root|mmc|error'
-logread | tail -100
 ```
 
-Expected: `/dev/fitrw` mounted on `/overlay`, root using that persistent overlay, saved LAN address retained, and no new F2FS errors. A read-only `/rom` showing 100% usage is normal squashfs behavior.
+Expect the writable root to use `/overlay`, not the temporary RAM fallback `/tmp/root`.
 
-## 5. Reflash fallback if repair fails
+## 9. Reflash if repair cannot recover the installation
 
-This section is a **future fallback, not an action performed in this incident**. Reflashing replaces the installed system and removes added packages. `-n` discards saved settings. Preserve evidence and backups first. Repeated corruption after a clean install should prompt power/storage/serial investigation rather than endless reflashes.
+**Reflashing was not performed in this incident. The procedure below is a fallback. It replaces installed firmware and, for a clean install, removes saved settings and added packages.** Preserve recoverable data first and keep power stable throughout.
 
-### A. Boot RAM recovery, verify target and image
+```mermaid
+flowchart LR
+    A["Preserve settings and evidence"] --> B["Verify compatible sysupgrade image"]
+    B --> C["Flash a clean installation"]
+    C --> D["Check that settings storage works"]
+    D --> E["Restore compatible configuration backup"]
+    E --> F["Reinstall selected packages<br/>Verify LAN, WAN, and Wi-Fi"]
+```
 
-Use sections B–D. Verify storage mapping, board, checksums, and free RAM. Unmount all manually mounted production filesystems before upgrading. Do not write the whole eMMC or its factory/calibration/bootloader partitions.
+### Prefer LuCI when it is available
 
-**Computer:** upload the already-verified sysupgrade image. `scp -O` uses the legacy protocol when the recovery image has no SFTP server:
+If the installed or recovery system offers LuCI:
+
+1. Open its management page and go to **System → Backup / Flash Firmware**.
+2. Under **Flash new firmware image**, choose the downloaded **sysupgrade** image.
+3. Check the device compatibility and checksum shown before confirmation.
+4. For this clean recovery, clear **Keep settings and retain the current configuration**. This intentionally discards old settings; have your private backup ready.
+5. Confirm flashing and wait. Do not disconnect power or interpret the temporary loss of the web page as a failed upgrade.
+
+The recovery image may omit LuCI. In that case use the terminal fallback below. Do not try to install a web interface onto a damaged live overlay just to avoid recovery SSH.
+
+### Terminal fallback for RAM recovery
+
+A graphical SFTP client can upload the verified sysupgrade image to `/tmp/sysupgrade.itb` **if** that recovery image provides SFTP. Otherwise use this legacy SCP command on the **computer**:
 
 ```sh
-scp -O -o BindAddress=192.168.1.254 \
-  "$HOME/Downloads/openwrt-recovery/sysupgrade.itb" root@192.168.1.1:/tmp/sysupgrade.itb
+scp -O "$HOME/Downloads/openwrt-recovery/openwrt-25.12.5-mediatek-filogic-cmcc_rax3000m-squashfs-sysupgrade.itb" root@192.168.1.1:/tmp/sysupgrade.itb
 ```
 
-**Router:**
+Before upgrading, unmount any manually mounted production/settings filesystems. On the **router**, validate before writing:
 
 ```sh
 sha256sum /tmp/sysupgrade.itb
 sysupgrade -T /tmp/sysupgrade.itb
 ```
 
-For the official 25.12.5 image the expected SHA-256 is `cd194d6ed64f1fa60d1315e9eafa156138c4c58b76817fb22370af26c4946b21`. Stop if validation fails. Do not bypass an unknown mismatch with `-F`.
-
-### B. Install cleanly
-
-**Destructive: replaces the production firmware and discards settings and added packages.** This is deliberately a separate step after successful validation:
+`-T` tests image compatibility. Stop on a mismatch; do not bypass an unexplained failure with `-F`. After successful checks, the following **destructive** command installs cleanly:
 
 ```sh
-# Router; unmount any manual production/overlay mounts first.
 sysupgrade -n /tmp/sysupgrade.itb
 ```
 
-Leave power connected until installation and boot finish. SSH disconnection is expected. The installed system normally starts at `192.168.1.1`, with Wi-Fi disabled until configured. Before adding extensive configuration, confirm the persistent overlay is mounted; the earlier [unformatted overlay note](config-lost-on-reboot.md) explains what to investigate if it falls back to RAM. Never format a currently mounted overlay.
+`-n` means do not retain configuration. SSH disconnection is expected. Once boot completes, return the computer to automatic wired addressing and open [192.168.1.1](http://192.168.1.1/). Wi-Fi is normally disabled until configured.
 
-### C. Restore the file-level backup
+### Restore settings through LuCI
 
-The archive `~/Downloads/OpenWrt-RAX3000M-Necessities.tar.gz` contains `etc/config/*`, account files, Dropbear host keys, and other settings. It is neither firmware nor a package backup. Inspect its file list and compatibility before restoring; it can reinstate passwords, network addresses, and startup behavior. It cannot repair physical storage.
+Before configuring extensively, check that the overlay is persistent. If settings storage is unformatted and changes only survive in RAM, follow the [separate unformatted-overlay guide](config-lost-on-reboot.md).
 
-For a compatible installation, use standard backup restore:
+In **System → Backup / Flash Firmware → Restore backup**, choose a compatible private `.tar.gz` configuration backup, such as the previously saved `OpenWrt-RAX3000M-Necessities.tar.gz`. Review its origin and contents before confirming; it can restore passwords and network addresses. Restart as prompted, or use **System → Reboot** after the restore.
 
-```sh
-# Computer
-tar -tzf "$HOME/Downloads/OpenWrt-RAX3000M-Necessities.tar.gz"
-scp -O -o BindAddress=192.168.1.254 \
-  "$HOME/Downloads/OpenWrt-RAX3000M-Necessities.tar.gz" root@192.168.1.1:/tmp/settings.tar.gz
-```
+The saved LAN address may return to `192.168.39.1`. Reconnect there. Reinstall added packages separately through **System → Software** where available. A configuration backup is not an app installer. Across incompatible firmware versions, migrate selected settings manually instead of restoring every old file.
 
-```sh
-# Router
-sysupgrade -r /tmp/settings.tar.gz
-sync
-reboot
-```
+The [repository snapshot](../../backups/2026-10-08/README.md) contains package names and metadata only. It is **not** the private settings archive needed for this restore.
 
-This restores files, then reboot applies them. Expect the LAN to change back to `192.168.39.1`; add the temporary `192.168.39.2` address as in section G before reconnecting. Packages such as OpenClash must be reinstalled separately. Across incompatible releases, manually migrate selected network/wireless settings instead of restoring the entire archive. Test basic LAN/WAN/Wi-Fi before enabling additional proxy services.
+## 10. Prevent recurrence and finish cleanup
 
-## 6. Prevention and collecting the next failure
+Use **System → Reboot** for normal restarts and allow it to finish. Keep private backups and verified recovery files off-router. After a future planned reboot, confirm the settings still persist.
 
-- Use LuCI or `reboot` for normal restarts and allow the shutdown to finish. `sync` flushes pending writes but cannot compensate for a faulty supply or filesystem bug.
-- Keep verified recovery and sysupgrade images plus private configuration backups off-router.
-- Confirm persistent overlay mounts after every flash; keep formatter/checker availability in mind when choosing a recovery image.
-- If corruption recurs, capture the **failing normal boot** through serial and preserve `/sys/fs/pstore` before rebooting again. Compare F2FS/MMC errors, watchdog resets, and power behavior. The current incident does not justify a claim that a specific package caused it.
-- Avoid periodic forced fsck on a mounted filesystem. Offline checking belongs in recovery with the overlay unmounted.
+If corruption recurs, collect normal failed-boot output and any crash records before wiping or reflashing. Repeated corruption merits investigation of power, storage, and software stability; another reflash alone does not identify the cause.
 
-## 7. Restore the computer after recovery
-
-Stop the TFTP server with **Ctrl+C in its terminal**. If that terminal was lost, identify the exact temporary process and stop only that PID with sudo; do not kill unrelated dnsmasq services.
-
-```sh
-nmcli connection down OpenWrt-Recovery
-nmcli connection delete OpenWrt-Recovery
-nmcli connection up 'Wired connection 1'
-ip -br addr
-ip route
-ip rule
-```
-
-Restore any pre-existing profile values from the records taken before recovery. If the intent is standard NetworkManager wired behavior, the defaults used in this session were:
-
-```sh
-nmcli connection modify 'Wired connection 1' \
-  connection.autoconnect-priority 0 \
-  ipv4.method auto ipv4.never-default no ipv4.route-metric -1 \
-  ipv4.route-table 0 ipv4.routing-rules '' \
-  ipv6.method auto ipv6.ignore-auto-routes no \
-  ipv6.never-default no ipv6.route-metric -1
-nmcli connection up 'Wired connection 1'
-```
-
-Do not overwrite deliberate pre-existing settings on another computer. No recovery static addresses or table-139 policy rules should remain. Keep genuine physical interfaces. Mihomo's TUN interface and its own policy rules belong to the proxy application; stop TUN through that application if no longer wanted rather than deleting its managed interface manually.
-
-If a temporary diagnostic SSH key was authorized, remove only its marked line from `/etc/dropbear/authorized_keys` before deleting the private/public key files on the computer. Preserve private evidence backups until the owner decides they are no longer needed.
+Stop the temporary TFTP server using its application's controls, or Ctrl+C in its terminal. In the computer's network settings, remove the temporary recovery profile and restore the original DHCP settings. Remove any temporary diagnostic SSH key. Keep genuine physical interfaces and unrelated applications intact.
 
 ## References
 
-- [Device support and OpenWrt U-Boot recovery](https://openwrt.org/toh/cmcc/rax3000m)
+- [Device support and bootloader recovery](https://openwrt.org/toh/cmcc/rax3000m)
+- [Firmware Selector](https://firmware-selector.openwrt.org/)
 - [Official 25.12.5 images and checksums](https://archive.openwrt.org/releases/25.12.5/targets/mediatek/filogic/)
-- [OpenWrt failsafe and factory reset](https://openwrt.org/docs/guide-user/troubleshooting/failsafe_and_factory_reset)
-- [Sysupgrade procedure](https://openwrt.org/docs/guide-user/installation/generic.sysupgrade)
-- [Sysupgrade options](https://openwrt.org/docs/techref/sysupgrade)
+- [TFTP recovery explained by OpenWrt](https://openwrt.org/docs/guide-user/troubleshooting/tftpserver)
+- [Failsafe instructions](https://openwrt.org/docs/guide-user/troubleshooting/failsafe_and_factory_reset)
+- [LuCI flashing procedure](https://openwrt.org/docs/guide-quick-start/sysupgrade.luci)
 - [Configuration backup and restore](https://openwrt.org/docs/guide-user/troubleshooting/backup_restore)

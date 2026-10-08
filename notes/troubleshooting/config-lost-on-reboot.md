@@ -1,362 +1,126 @@
-# Config Lost on Reboot (tmpfs Overlay)
+# Settings disappear after reboot
 
-**Device:** CMCC RAX3000M (eMMC)  
-**Platform:** MediaTek Filogic (`mt7981b-cmcc-rax3000m-emmc`)  
-**Firmware observed:** OpenWrt 25.12.5 (`mediatek-filogic` squashfs sysupgrade ITB)  
-**Date diagnosed:** 2026-07-24  
-**Status:** Fixed after manual format of `/dev/fitrw` as f2fs
+**Observed device:** CMCC RAX3000M with eMMC storage. **Firmware:** OpenWrt 25.12.5.
 
----
+**Diagnosed:** 2026-07-24. **Result:** Fixed by creating the missing persistent settings filesystem.
 
-## 1. Symptom
+## 1. Symptoms
 
-After reboot, the router behaves like a freshly flashed device:
+The router looks newly installed after every restart: saved Wi-Fi settings vanish, added packages disappear, and a custom LAN address such as `192.168.39.1` returns to `192.168.1.1`. Settings work until the next reboot.
 
-- All previous settings and configuration files are gone
-- Custom LAN IP (e.g. `192.168.39.1`) reverts to stock `192.168.1.1`
-- Packages installed after flash disappear
-- `/etc/config/*` changes do not survive reboot
-- Device looks like factory defaults every boot
+## 2. Why changes were lost
 
-This is **not** a normal factory-reset loop and **not** caused by a bad LAN UCI change by itself.
+OpenWrt normally stores changed settings and added software in a writable **overlay**, layered over its read-only firmware. The overlay should be on flash storage so it survives a restart.
 
----
+In this incident, `/dev/fitrw`, the eMMC space intended for that overlay, had never been formatted. The firmware lacked a **formatter**, the program that creates a filesystem on storage. OpenWrt instead used **tmpfs**, a filesystem held in RAM. RAM loses its contents when the system restarts, so every change disappeared.
 
-## 2. Root Cause
+```mermaid
+flowchart TD
+    A["Save a setting"] --> B{"Where is the writable overlay?"}
+    B -->|"Flash storage: /overlay"| C["Setting survives reboot"]
+    B -->|"RAM: /tmp/root"| D["Setting disappears on reboot"]
+    D --> E{"Why was flash not attached?"}
+    E -->|"Never formatted"| F["Create its filesystem after backup"]
+    E -->|"Existing filesystem damaged"| G["Use offline repair guide instead"]
+```
 
-Settings were never written to flash. The writable root overlay lived only in **RAM (tmpfs)**.
+The **filesystem** organizes files on storage. **F2FS** is the filesystem used for this device's saved settings; **eMMC** is its internal flash storage. Formatting creates a filesystem and erases the old contents. Repair tries to recover an existing one.
 
-### Boot / storage model on this device
-
-1. Firmware boots from squashfs (`/dev/fit0` / `/rom`)
-2. Persistent writable overlay should live on residual eMMC space: **`/dev/fitrw`**
-3. `mount_root` expects that residual partition to be formatted as **f2fs** (preferred) or **ext4**
-4. If the partition is still unformatted (OpenWrt magic `0xdeadc0de`), first-boot setup should format it
-5. This image had **no userspace formatter** (`mkfs.f2fs` / `mkfs.ext4` missing)
-6. Kernel had f2fs/ext4 support, but without `mkf2fs` / `e2fsprogs`, format never happened
-7. `mount_root` fell back to a temporary RAM overlay
-8. All config lived in tmpfs → reboot restored stock state
-
-### Diagnostic evidence (broken state)
-
-| Check | Broken result |
+| Evidence in the broken state | Meaning |
 |---|---|
-| Root mount | `overlayfs:/tmp/root` on **tmpfs** |
-| Persistent overlay device | `/dev/fitrw` present but unused as real overlay |
-| Magic on `/dev/fitrw` | `de ad c0 de` = OpenWrt “not formatted yet” marker |
-| Boot log | `mount_root: overlay filesystem in /dev/fitrw has not been formatted yet` |
-| Boot log | `mount_root: jffs2 not ready yet, using temporary tmpfs overlay` |
-| Later error | `failed - mount -t jffs2 /dev/fitrw /rom/overlay: Invalid argument` |
-| Format tools | `mkfs.f2fs` / `mkfs.ext4` **missing** from image |
+| Root uses `overlayfs:/tmp/root` | Changes are going to RAM |
+| `/dev/fitrw` starts with `de ad c0 de` | OpenWrt's unformatted marker |
+| Log says `overlay filesystem ... has not been formatted yet` | Persistent storage is not initialized |
+| `mkfs.f2fs` and `mkfs.ext4` absent | First-boot setup lacks a formatter |
 
-### Why this is common on filogic eMMC / FIT residual builds
+This explanation applies to the observed incident. A temporary RAM overlay can have other causes. If an existing filesystem reports corruption, follow [router unreachable after reboot](router-unreachable.md) before formatting.
 
-- Residual space after the FIT image is exposed as `/dev/fitrw`
-- `fstools` prefers f2fs for that residual area
-- Some custom / slim images omit `mkf2fs` (and sometimes `e2fsprogs`)
-- Without a formatter package, first boot cannot create `rootfs_data`
-- Result: perpetual “fresh flash / RAM-only config” mode
+## 3. Diagnose before changing storage
 
----
+### Start in the browser
 
-## 3. Fix
+Open the router's management page, usually [192.168.1.1](http://192.168.1.1/) in this broken state. **LuCI** is OpenWrt's web interface.
 
-If the overlay already contains an F2FS filesystem but fails to mount, see [Router unreachable after reboot](router-unreachable.md) before formatting. Preserve its contents and try offline repair first. The formatting commands below erase existing data and must never run on a mounted overlay.
+1. Go to **System → Backup / Flash Firmware → Generate archive**. Download settings that are still accessible before restarting.
+2. Open **Status → Kernel Log** and look for `mount_root`, `overlay`, and “has not been formatted yet.”
+3. Open **System → Software**, update the package list, and check whether `mkf2fs` is installed. That package provides the F2FS formatter. Installing it does not itself prove that the overlay has become persistent.
 
-SSH in while the router is still reachable at stock IP:
+Menu names can vary by LuCI version and language. If LuCI is missing, use SSH, an encrypted command-line connection.
+
+### Confirm the storage mapping in SSH
+
+**Computer:**
 
 ```sh
 ssh root@192.168.1.1
 ```
 
-### Step 1 — Install a formatter (if missing)
-
-Preferred:
+**Router:**
 
 ```sh
-apk update
-apk add mkf2fs
-```
-
-Fallback:
-
-```sh
-apk update
-apk add e2fsprogs
-```
-
-Confirm:
-
-```sh
-ls -l /usr/sbin/mkfs.f2fs /usr/sbin/mkfs.ext4 2>/dev/null
-```
-
-### Step 2 — Format the persistent overlay partition
-
-Preferred (f2fs):
-
-```sh
-/usr/sbin/mkfs.f2fs -q -f -l rootfs_data /dev/fitrw
-```
-
-Fallback (ext4):
-
-```sh
-mkfs.ext4 -q -F -L rootfs_data /dev/fitrw
-```
-
-> **Warning:** this wipes whatever is on `/dev/fitrw`. On a broken RAM-overlay system there is usually nothing durable there to keep.
-
-### Step 3 — Reboot so `mount_root` attaches the real overlay
-
-```sh
-reboot
-```
-
-### Step 4 — Re-apply settings (they can now persist)
-
-Example: restore custom LAN IP:
-
-```sh
-ssh root@192.168.1.1
-
-# classic single-value style
-uci set network.lan.ipaddr='192.168.39.1'
-uci commit network
-/etc/init.d/network restart
-```
-
-Or newer list-style if your image uses CIDR lists:
-
-```sh
-uci delete network.lan.ipaddr
-uci add_list network.lan.ipaddr='192.168.39.1/24'
-uci commit network
-/etc/init.d/network restart
-```
-
-Reconnect at the new IP and reboot once more to confirm it sticks.
-
----
-
-## 4. Verification
-
-### Healthy after fix (observed good state)
-
-```sh
-mount | grep 'on / '
+cat /proc/mounts
 df -h
-dmesg | grep -i overlay
+dmesg | grep -iE 'overlay|fitrw|mount_root|f2fs'
+hexdump -C -n 16 /dev/fitrw
+ls -l /usr/sbin/mkfs.f2fs /usr/sbin/mkfs.ext4
 ```
 
-#### Expected mount
+These commands inspect mounts, free space, boot messages, the beginning of the settings partition, and available formatters. They do not format storage.
 
-```text
-overlayfs:/overlay on / type overlay (rw,noatime,lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work,...)
-```
+Proceed only after confirming an unformatted settings area on the expected eMMC device. `/dev/fitrw` must not be mounted. If the device mapping is uncertain, use the [recovery environment](router-unreachable.md) to inspect it offline.
 
-Key points:
+## 4. Create the settings filesystem
 
-- Path is **`overlayfs:/overlay`**
-- **Not** `overlayfs:/tmp/root`
-- Upper dir is `/overlay/upper`
+**Destructive operation:** formatting erases everything on the selected device. Preserve settings first. Do not run these commands on a mounted overlay, on a NAND variant, or merely because the management page is unavailable.
 
-#### Expected df
-
-```text
-/dev/root     ~5M     100%  /rom
-tmpfs         ~RAM          /tmp
-/dev/fitrw    ~2.0G   ~5%   /overlay
-overlayfs:/overlay ~2.0G    /
-```
-
-Key points:
-
-- `/overlay` is on **`/dev/fitrw`**
-- Size is real flash residual space (here ~2G)
-- Root overlay reports that same size
-
-#### Expected dmesg
-
-```text
-mount_root: overlay filesystem has not been fully initialized yet
-mount_root: switching to f2fs overlay
-overlayfs: null uuid detected in lower fs '/', falling back to xino=off,index=off,nfs_export=off.
-```
-
-Interpretation:
-
-| Message | Meaning |
-|---|---|
-| `switching to f2fs overlay` | **Success** — real flash overlay is in use |
-| `has not been fully initialized yet` | Normal on first boot after format |
-| `null uuid detected in lower fs '/'` | Harmless squashfs lower-layer warning |
-
-### Final persistence test
-
-Change something small, reboot, confirm it survives:
-
-```sh
-uci set system.@system[0].hostname='DaveRouter'
-uci commit system
-reboot
-```
-
-After reboot:
-
-```sh
-uci get system.@system[0].hostname
-mount | grep 'on / '
-```
-
-Pass criteria:
-
-1. Hostname still `DaveRouter`
-2. `/` still `overlayfs:/overlay`
-3. `/dev/fitrw` still mounted on `/overlay`
-
----
-
-## 5. Prevention
-
-### A. Bake the formatter into the image (best)
-
-Include one of these in the image package set:
-
-- `mkf2fs` (preferred for residual eMMC / FIT residual)
-- and/or `e2fsprogs` (ext4 fallback)
-
-Then first boot can auto-format `/dev/fitrw` instead of falling back to tmpfs.
-
-For custom builds / image builders, ensure `fstools` has the matching mkfs helper available at first boot.
-
-### B. Keep the formatter installed after recovery
-
-Once overlay is healthy:
-
-```sh
-apk add mkf2fs
-```
-
-This helps if overlay is ever wiped / recreated later.
-
-### C. Verify overlay immediately after every flash / sysupgrade
-
-Right after first boot of a new image:
-
-```sh
-mount | grep 'on / '
-df -h | sed -n '1,10p'
-dmesg | grep -iE 'overlay|fitrw|mount_root'
-```
-
-If you see `overlayfs:/tmp/root` or “using temporary tmpfs overlay”, **do not configure the router yet**. Fix overlay first, or all work will vanish on reboot.
-
-### D. Avoid false “factory reset” actions while debugging
-
-Do **not** run these unless you intentionally want a wipe:
-
-- `firstboot`
-- `jffs2reset -y`
-- factory-reset button / LuCI reset
-
-Also note:
-
-- “Keep settings” during flash is useless while overlay is broken (there is nothing durable to keep)
-- Installing packages before overlay is fixed only stores them in RAM
-
-### E. Optional hardening checklist after recovery
-
-```sh
-# 1) overlay healthy
-mount | grep 'on / '
-df -h | grep -E 'fitrw|overlay'
-
-# 2) keep formatter available
-apk add mkf2fs
-
-# 3) take a backup once config is restored
-sysupgrade -b /tmp/backup-OpenWrt-$(date +%F).tar.gz
-# then scp it off-router
-```
-
----
-
-## 6. Quick Decision Tree
-
-```text
-Config lost after reboot?
-│
-├─ mount | grep 'on / ' shows overlayfs:/tmp/root
-│    └─ RAM overlay. Check /dev/fitrw + dmesg mount_root
-│         ├─ magic deadc0de / “has not been formatted yet”
-│         │    └─ install mkf2fs (or e2fsprogs) → format /dev/fitrw → reboot
-│         └─ format tools missing from image
-│              └─ same fix; also bake mkf2fs into next image
-│
-└─ mount shows overlayfs:/overlay and /dev/fitrw is mounted
-     └─ overlay is healthy; look elsewhere
-          (wrong config, failsafe, dual-boot partition, external reset, etc.)
-```
-
----
-
-## 7. Commands Cheat Sheet
-
-### Broken-state diagnosis
-
-```sh
-mount | grep 'on / '
-df -h
-dmesg | grep -iE 'overlay|fitrw|mount_root|jffs2|f2fs'
-hexdump -C -n 16 /dev/fitrw | head
-which mkfs.f2fs mkfs.ext4 2>/dev/null
-ls -l /usr/sbin/mkfs.f2fs /usr/sbin/mkfs.ext4 2>/dev/null
-```
-
-### Recovery
+If the formatter is missing, install **mkf2fs** through **System → Software**. Without LuCI, the corresponding **router** commands are:
 
 ```sh
 apk update
 apk add mkf2fs
+```
+
+Then, with `/dev/fitrw` confirmed unformatted and unmounted, run on the **router**:
+
+```sh
 /usr/sbin/mkfs.f2fs -q -f -l rootfs_data /dev/fitrw
 reboot
 ```
 
-### Healthy-state verification
+`mkfs.f2fs` creates the filesystem; `rootfs_data` is its label. This low-level operation has no equivalent LuCI button that safely targets only this observed partition.
+
+The earlier procedure also recorded ext4 as a fallback filesystem using `e2fsprogs`. Do not switch formats casually; the F2FS path is the observed successful fix and should remain the documented default.
+
+## 5. Verify and restore through LuCI
+
+Reconnect after boot. In **Status → Kernel Log**, look for `switching to f2fs overlay`. For an exact check, run these **router** commands:
 
 ```sh
-mount | grep 'on / '
-# expect: overlayfs:/overlay ... upperdir=/overlay/upper
-
-df -h
-# expect: /dev/fitrw mounted on /overlay with multi-hundred-MB or GB size
-
-dmesg | grep -i overlay
-# expect: switching to f2fs overlay
+cat /proc/mounts | grep -E 'fitrw|overlay'
+df -h /overlay
 ```
 
----
-
-## 8. Related Paths / Devices (this platform)
-
-| Path / device | Role |
+| Result | Interpretation |
 |---|---|
-| `/dev/fit0` | FIT / squashfs root image (`/rom`) |
-| `/dev/fitrw` | Residual eMMC space for writable overlay (`rootfs_data`) |
-| `/rom` | Read-only base firmware |
-| `/overlay` | Writable upper layer (must be on flash, not tmpfs) |
-| `/` | `overlayfs` combining `/rom` + `/overlay` |
-| `/tmp/root` | Temporary RAM overlay used when real overlay is unavailable |
+| `/dev/fitrw` mounted at `/overlay`; root uses `overlayfs:/overlay` | Persistent settings storage is attached |
+| Root uses `overlayfs:/tmp/root` | Still using RAM; investigate before configuring more |
+| Read-only `/rom` shows 100% usage | Normal fixed-size firmware image, not a full settings partition |
 
----
+The observed repaired overlay was about 2 GiB. Its size is device-specific; an unrelated router may differ.
 
-## 9. Bottom Line
+Use **System → Backup / Flash Firmware → Restore backup** to restore a compatible private archive, or re-enter settings through LuCI. Change the LAN address through **Network → Interfaces → LAN → Edit** if needed; reconnect at the new address after applying.
 
-This was **not** a random OpenWrt settings bug and not caused by the LAN IP change itself.
+For a persistence test, make a small recognizable change in **System → System**, such as the hostname. Save it, restart through **System → Reboot**, then check that both the change and the persistent overlay remain. Keep the original value if the change was only a test.
 
-The eMMC residual partition **`/dev/fitrw` was never formatted**, so the router ran every boot with a **tmpfs overlay**. All configuration lived in RAM and disappeared on reboot.
+## 6. Prevention
 
-**Fix:** install `mkf2fs` → format `/dev/fitrw` as f2fs → reboot → verify `overlayfs:/overlay` on `/dev/fitrw` → reconfigure.
+When selecting/building firmware for this eMMC layout, include the appropriate formatter package rather than relying on a later RAM-only installation. After each flash, confirm the persistent overlay before spending time configuring Wi-Fi or apps.
 
-**Prevent:** include `mkf2fs` in the image, and always verify the overlay mount right after flash before investing time in configuration.
+Keep private backups outside the repository. A LuCI backup contains configuration files, not every installed app. The [package snapshot](../../backups/2026-10-08/README.md) can help identify packages to reinstall.
+
+Do not use a factory-reset button or `mkfs` as a substitute for diagnosing a formatted but corrupt overlay. That case has a separate [repair and reflash guide](router-unreachable.md).
+
+## References
+
+- [OpenWrt backup and restore](https://openwrt.org/docs/guide-user/troubleshooting/backup_restore)
+- [Recovery for a corrupt existing overlay](router-unreachable.md)

@@ -1,209 +1,107 @@
-# OpenClash Breaks Remote SSH (Fake-IP + Transparent Proxy)
+# OpenClash interrupts remote SSH
 
-**Firmware observed:** OpenWrt (aarch64, kernel 6.12.x) with OpenClash (Meta/mihomo core)  
-**Date diagnosed:** 2026-07-25  
-**Status:** Fixed by sending all destination port 22 traffic `DIRECT`
+**Observed software:** OpenWrt with OpenClash using the Meta/mihomo core.
 
----
+**Diagnosed:** 2026-07-25. **Result:** Remote SSH worked after destination port 22 was routed directly.
 
-## 1. Symptom
+## 1. Symptoms
 
-On the OpenClash-enabled LAN/Wi‑Fi:
+An SSH connection to a remote server fails while the client uses the OpenClash-enabled network, but works through an independent connection. A typical message is:
 
 ```text
-ssh user@example.com
 Connection closed by 198.18.x.x port 22
-```
-
-Verbose SSH shows:
-
-```text
-Connecting to example.com [198.18.x.x] port 22.
-Connection established.
-Local version string SSH-2.0-OpenSSH_...
 kex_exchange_identification: Connection closed by remote host
 ```
 
-Same host works on an unproxied / “native” network (direct modem/ISP path).
+**SSH** provides an encrypted remote terminal and normally uses TCP port 22. “Key exchange” is the connection's initial security negotiation. An interruption there does not by itself mean the user's login key is incorrect.
 
-Typical fake-IP address range: **`198.18.0.0/16`**.
+## 2. What caused the failure
 
----
+**DNS** translates names such as `example.com` into addresses. In **Fake-IP mode**, OpenClash returns a synthetic address, often in `198.18.0.0/16`, and remembers the corresponding hostname. The unusual address can be expected behavior rather than an error.
 
-## 2. Root Cause
+A **transparent proxy** can also redirect network traffic without the client explicitly selecting a proxy. In this incident, the proxy path interrupted SSH. Even connecting to the server's real IP failed on the affected network, while an independent connection succeeded.
 
-Two OpenClash behaviors stack:
-
-### A. Fake-IP DNS
-
-With:
-
-- `operation_mode` / `en_mode` = `fake-ip`
-- `enhanced-mode: fake-ip`
-- `fake-ip-range: 198.18.0.1/16`
-- DNS redirect enabled (`enable_redirect_dns` / dnsmasq hijack)
-
-LAN clients do **not** receive the real A record for many hostnames. OpenClash answers with a synthetic address in `198.18.0.0/16`.
-
-Evidence:
-
-| Network | `getent hosts example.com` |
-|---|---|
-| OpenClash LAN | `198.18.x.x` |
-| Public DNS / unproxied path | real public IP (e.g. AWS `18.x.x.x`) |
-
-### B. Transparent proxy of SSH
-
-Even when connecting by **real IP**, SSH can still fail on the OpenClash network because TCP/22 is intercepted by the transparent proxy path (nftables/fw4 + clash). The client completes TCP connect, then the handshake dies (`kex_exchange_identification` / empty banner).
-
-So:
-
-- Fake-IP explains the weird `198.18.*` address
-- Transparent hijack explains “all remote SSH is broken,” not only one domain
-
-This is **not** an SSH key problem and **not** a server-side OpenSSH misconfig when the unproxied path works.
-
----
-
-## 3. Fix (permanent, all SSH)
-
-Send **all destination port 22** traffic direct. Do **not** rely on per-domain exceptions.
-
-### On the router
-
-```sh
-ssh root@<router-lan-ip>
+```mermaid
+flowchart LR
+    C["SSH client"] --> D["DNS returns a synthetic address"]
+    D --> P["OpenClash identifies the destination"]
+    P --> R{"Routing rule"}
+    R -->|"Proxy path that failed here"| X["SSH negotiation interrupted"]
+    R -->|"Port 22: DIRECT"| S["Connect directly to SSH server"]
 ```
 
-1. Backup and write top custom rules:
+Changing only a hostname's DNS exception would not cover every SSH destination. The successful rule matched the **destination port**, so all ordinary port-22 SSH connections used the direct path. Direct routing bypasses the proxy, not the network firewall, and still requires the destination to be reachable.
+
+## 3. Fix in the web interface
+
+Open the router's LuCI management page and go to **Services → OpenClash**. Locate its custom rules or rule settings; tab names vary by OpenClash version.
+
+1. Save a private copy of the existing custom rules.
+2. Enable custom Clash rules.
+3. In the **top/priority custom rules** area, add `DST-PORT,22,DIRECT` before general proxy rules. Preserve all existing rules.
+4. Save/apply and restart OpenClash through its controls.
+
+If the editor expects YAML, the rule belongs under its existing `rules:` list:
+
+```yaml
+rules:
+  - DST-PORT,22,DIRECT
+```
+
+**YAML** is the structured text format used by Clash configuration. The indentation matters. Do not replace a populated rules file with only this example.
+
+If the SSH server uses a different port, use that destination port instead. “Top” matters because the first matching rule generally determines the routing choice.
+
+### Terminal fallback
+
+Use this only if the relevant web editor is unavailable. On the **router**, preserve the current top custom-rules file:
 
 ```sh
-TS=$(date +%Y%m%d-%H%M%S)
 cp -a /etc/openclash/custom/openclash_custom_rules.list \
-  /etc/openclash/custom/openclash_custom_rules.list.bak-$TS
-
-printf '%s\n' \
-  '# OpenClash custom rules (top)' \
-  '# Keep SSH out of the transparent proxy path permanently.' \
-  'rules:' \
-  '  - DST-PORT,22,DIRECT' \
-  > /etc/openclash/custom/openclash_custom_rules.list
+  /etc/openclash/custom/openclash_custom_rules.list.backup
+vi /etc/openclash/custom/openclash_custom_rules.list
 ```
 
-2. Enable custom Clash rules and commit:
+Add the rule to the top of its existing `rules:` list, then enable custom rules and restart:
 
 ```sh
 uci set openclash.config.enable_custom_clash_rules='1'
 uci commit openclash
-```
-
-3. Restart OpenClash:
-
-```sh
 /etc/init.d/openclash restart
 ```
 
-Notes:
+**UCI** is OpenWrt's configuration system. `uci commit` saves the setting persistently; it does not itself restart the service. The lower-priority file `openclash_custom_rules_2.list` is not the right place when an earlier rule already catches SSH.
 
-- OpenClash loads `/etc/openclash/custom/openclash_custom_rules.list` at the **top** of `rules:` when `enable_custom_clash_rules=1`
-- File format is YAML. Either a bare array or a hash with `rules:` works; OpenClash’s Ruby merge accepts both
-- BusyBox on many OpenWrt images has **no `base64`**; use `printf` / `cat` heredoc instead
-- `openclash_custom_rules_2.list` is the bottom-insert file; SSH bypass belongs in the **top** file
+## 4. Verify the result
 
-### Optional LuCI path
+Reconnect to the remote server using your usual SSH application. If OpenClash's dashboard shows connection/rule decisions, check that port-22 traffic selects **DIRECT**.
 
-OpenClash → Rules / Custom rules:
-
-- Enable custom rules
-- Add top rule: `DST-PORT,22,DIRECT`
-- Apply / restart
-
----
-
-## 4. Verification
-
-### On router
+For an optional **computer terminal** test:
 
 ```sh
-# custom rule present
-cat /etc/openclash/custom/openclash_custom_rules.list
-
-# enabled
-uci get openclash.config.enable_custom_clash_rules   # expect 1
-
-# first generated rule is DST-PORT 22
-grep -n 'DST-PORT,22' /etc/openclash/tag.yaml | head
-awk '/^rules:/{f=1} f{print; c++; if(c>5) exit}' /etc/openclash/tag.yaml
-
-# runtime API: index 0 should be DstPort 22 -> DIRECT
-SECRET=$(uci get openclash.config.dashboard_password)
-curl -s -H "Authorization: Bearer $SECRET" http://127.0.0.1:9090/rules | head -c 400
+ssh -o ConnectTimeout=10 user@example.com 'hostname'
 ```
 
-Expected runtime rule shape:
+Use your actual server and username. You should see the remote hostname rather than a closed connection during negotiation. A DNS lookup may still return `198.18.x.x`; that is acceptable if SSH works through the direct rule.
 
-```json
-{"index":0,"type":"DstPort","payload":"22","proxy":"DIRECT", ...}
+In the observed incident, both hostname-based and real-IP connections succeeded, and the running rule list showed port 22 routed directly at highest priority.
+
+```mermaid
+flowchart TD
+    A["SSH fails on the proxy-enabled network"] --> B{"Works on an independent connection?"}
+    B -->|No| C["Check destination, firewall, and SSH service"]
+    B -->|Yes| D{"Real destination IP also fails?"}
+    D -->|Yes| E["Inspect traffic interception<br/>Add and verify the direct port rule"]
+    D -->|No| F["Inspect DNS and hostname-specific rules"]
 ```
 
-### On client
+## 5. Keep the fix working
 
-```sh
-# may still show 198.18.x under fake-ip mode; that alone is OK after the port-22 rule
-getent hosts <ssh-host>
+After subscription/rule updates, confirm custom rules remain enabled and the direct rule still precedes catch-all proxy rules. Keep the configuration backup private because other rules or subscription files can contain credentials.
 
-ssh -o ConnectTimeout=10 user@<ssh-host> 'echo SSH_OK; hostname'
-# also verify by real IP if known
-ssh -o ConnectTimeout=10 user@<real-ip> 'echo SSH_OK_IP; hostname'
-```
+Do not disable SSH authentication or replace server keys merely because the proxy interrupted the handshake. Also, a direct rule cannot overcome an upstream network that blocks SSH entirely.
 
-Successful fix: remote command output appears; no `Connection closed by 198.18...` during KEX.
+## References
 
-Observed after fix (2026-07-25):
-
-- Runtime rule index `0` = `DstPort 22 → DIRECT`
-- Hostname SSH succeeded even while DNS still returned a fake-IP
-- Real-IP SSH also succeeded
-
----
-
-## 5. Prevention / operational notes
-
-- Prefer **port-based** SSH bypass (`DST-PORT,22,DIRECT`) over domain allowlists if “all remote SSH” must work
-- Domain/fake-ip-filter exceptions only help name resolution for specific hosts; they do **not** fully replace a port-22 DIRECT rule when transparent proxy is the failure mode
-- After subscription updates, confirm custom rules are still enabled and still first in the generated `rules:` list
-- Keep a dated backup of `openclash_custom_rules.list` before edits
-- Switching entire mode from Fake-IP → Redir-Host is a larger hammer; not required if only SSH is broken
-
-### What not to do
-
-- Do not “fix” this by disabling OpenSSH keys or reinstalling the remote server when unproxied access already works
-- Do not put live dashboard passwords, node credentials, or full config dumps into notes/git
-
----
-
-## 6. Quick decision tree
-
-```text
-SSH fails only on OpenClash network?
-  ├─ resolves to 198.18.0.0/16  → Fake-IP involved
-  ├─ real IP also fails on that network → transparent proxy hijack
-  └─ unproxied network works → server is fine; fix OpenClash rules
-
-Want all SSH working permanently?
-  └─ enable custom rules + top rule: DST-PORT,22,DIRECT → restart OpenClash
-```
-
----
-
-## 7. Related paths
-
-| Path | Role |
-|---|---|
-| `/etc/openclash/custom/openclash_custom_rules.list` | Top custom rules (YAML) |
-| `/etc/openclash/custom/openclash_custom_rules_2.list` | Bottom custom rules |
-| `/etc/config/openclash` | UCI (`enable_custom_clash_rules`, mode, DNS) |
-| `/etc/openclash/tag.yaml` | Generated runtime config (name may match active profile) |
-| `/etc/openclash/config/*.yaml` | Subscription / profile source |
-| `/tmp/openclash.log` | Start/restart log |
-| `http://127.0.0.1:9090/rules` | Clash/Meta rules API (needs dashboard secret) |
+- [OpenClash custom-rule examples](https://github.com/vernesong/OpenClash/blob/master/luci-app-openclash/root/etc/openclash/custom/openclash_custom_rules.list)
+- [Main recovery guide](router-unreachable.md)
