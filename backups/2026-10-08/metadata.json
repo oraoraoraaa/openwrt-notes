@@ -1,0 +1,14 @@
+{
+  "captured_date": "2026-10-08",
+  "timezone": "Asia/Shanghai",
+  "firmware": "25.12.5",
+  "revision": "r33051-f5dae5ece4",
+  "kernel": "6.12.94",
+  "target": "mediatek/filogic",
+  "architecture": "aarch64_cortex-a53",
+  "model_reported_by_owner": "CMCC RAX3000Me",
+  "model_reported_by_firmware": "CMCC RAX3000M",
+  "storage": "eMMC",
+  "package_count": 198,
+  "requested_package_count": 40
+}

@@ -12,7 +12,8 @@ notes/
 ## Notes
 
 | Note | Summary |
-|---|---|
+| --- | --- |
+| [Packages and Metadata](backups/2026-10-08) | Package inventories and core metadata |
 | [Router unreachable after reboot](notes/troubleshooting/router-unreachable.md) | Corrupt F2FS overlay; TFTP recovery, offline repair, and reflash fallback |
 | [Config lost on reboot](notes/troubleshooting/config-lost-on-reboot.md) | tmpfs overlay when residual flash was never formatted |
 | [OpenClash breaks remote SSH](notes/troubleshooting/openclash-ssh-broken.md) | Fake-IP + transparent proxy; fix with `DST-PORT,22,DIRECT` |
