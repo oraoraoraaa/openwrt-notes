@@ -61,6 +61,8 @@ Settings were never written to flash. The writable root overlay lived only in **
 
 ## 3. Fix
 
+If the overlay already contains an F2FS filesystem but fails to mount, see [Router unreachable after reboot](router-unreachable.md) before formatting. Preserve its contents and try offline repair first. The formatting commands below erase existing data and must never run on a mounted overlay.
+
 SSH in while the router is still reachable at stock IP:
 
 ```sh
