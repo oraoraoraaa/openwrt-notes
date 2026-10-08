@@ -1,10 +1,15 @@
 # Router unreachable after reboot
 
-**Device reported by owner:** CMCC RAX3000Me  
-**Model reported by firmware:** CMCC RAX3000M (shared image profile)  
-**Observed storage:** eMMC, `SCA64G`, 58.2 GiB; MT7531 LAN switch  
-**Firmware:** OpenWrt 25.12.5, `r33051-f5dae5ece4`, kernel 6.12.94  
-**Date:** 2026-10-08 (Asia/Shanghai)  
+**Device reported by owner:** CMCC RAX3000Me
+
+**Model reported by firmware:** CMCC RAX3000M (shared image profile)
+
+**Observed storage:** eMMC, `SCA64G`, 58.2 GiB; MT7531 LAN switch
+
+**Firmware:** OpenWrt 25.12.5, `r33051-f5dae5ece4`, kernel 6.12.94
+
+**Date:** 2026-10-08 (Asia/Shanghai)
+
 **Status:** Recovered through TFTP RAM boot and offline F2FS repair; no reflash
 
 ## 1. Symptom
