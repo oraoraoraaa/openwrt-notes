@@ -9,6 +9,7 @@ Practical guides for understanding and recovering an OpenWrt router. Start with 
 | Router disappears after reboot; LAN and Wi-Fi cannot be reached | [Router unreachable after reboot](notes/troubleshooting/router-unreachable.md): diagnosis, TFTP recovery, offline repair, and reflash fallback |
 | Router works, but saved settings disappear after restarting | [Settings disappear after reboot](notes/troubleshooting/config-lost-on-reboot.md): settings were kept in temporary memory |
 | Remote SSH works elsewhere but fails through OpenClash | [OpenClash interrupts remote SSH](notes/troubleshooting/openclash-ssh-broken.md): understand Fake-IP and add a direct rule |
+| Phone Wi-Fi lags while the computer is fast | [Phone Wi-Fi lag](notes/troubleshooting/phone-wifi-lag.md): test the local link and reconnect only the affected client |
 | Reinstalling software after a clean flash | [Package snapshot](backups/2026-10-08/README.md): requested package names and device metadata; not a settings backup |
 
 ```mermaid
@@ -16,9 +17,11 @@ flowchart TD
     A["What stopped working?"] --> B["Cannot reach the router"]
     A --> C["Settings disappear after reboot"]
     A --> D["Only remote SSH fails"]
+    A --> P["Phone lags; computer is fast"]
     B --> E["Recovery and reflash guide"]
     C --> F["Persistent settings storage guide"]
     D --> G["OpenClash routing guide"]
+    P --> Q["Phone Wi-Fi diagnosis and reconnect guide"]
 ```
 
 ## How to use these notes
